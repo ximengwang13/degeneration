@@ -728,6 +728,11 @@ def main():
             
             # Boundary checks
             self.rect.x = max(0, min(self.rect.x, world_width - self.rect.width))
+
+            # -1层禁止通过走出边界切图（只能通过电梯切换楼层）
+            if map_level == -1:
+                self.rect.y = max(0, min(self.rect.y, world_height - self.rect.height))
+                return None
             
             # Check if player goes beyond the top boundary
             if self.rect.y < 0:
@@ -1870,6 +1875,17 @@ def main():
             right_seg_x = breach_x + breach_w
             if right_seg_x < b_right:
                 obstacles.append(Obstacle_class(right_seg_x, b_bottom - wall, b_right - right_seg_x, wall))
+            # 破门演出用的最底部展示墙：中间段可被同一事件“破开”
+            sw = basement_bottom_showcase_wall_rect
+            sb = basement_bottom_showcase_breach_rect
+            if sb.x > sw.x:
+                obstacles.append(Obstacle_class(sw.x, sw.y, sb.x - sw.x, sw.height))
+            if not basement_breach_wall_opened:
+                obstacles.append(Obstacle_class(sb.x, sb.y, sb.width, sb.height))
+            right_seg_x2 = sb.x + sb.width
+            right_end_x2 = sw.x + sw.width
+            if right_seg_x2 < right_end_x2:
+                obstacles.append(Obstacle_class(right_seg_x2, sw.y, right_end_x2 - right_seg_x2, sw.height))
 
             # 中央竖向通道左右墙（少量大门洞，避免房间碎片化）
             gap_centers = [1100, 2050, 2950]
@@ -2734,7 +2750,7 @@ def main():
             recoil_kick_y *= scale
     
     # RPG范围伤害函数
-    def apply_explosion_damage(explosion_x, explosion_y, explosion_radius, base_damage, enemies_list, boss_list, obstacles_list):
+    def apply_explosion_damage(explosion_x, explosion_y, explosion_radius, base_damage, enemies_list, boss_list, obstacles_list, zombies_list=None):
         """
         应用爆炸范围伤害，伤害随距离衰减
         explosion_x, explosion_y: 爆炸中心坐标
@@ -2760,6 +2776,7 @@ def main():
         explosion_center = pygame.math.Vector2(explosion_x, explosion_y)
         damaged_enemies = []
         damaged_bosses = []
+        damaged_zombies = []
         
         # 对敌人造成范围伤害
         for enemy in enemies_list[:]:
@@ -2812,8 +2829,26 @@ def main():
                     print(f"Boss被爆炸击杀！掉落rpg武器！")
                     corpses_for_current_map.append(Corpse(boss.rect.centerx, boss.rect.centery, boss.original_image, boss.facing_angle))
                     boss_list.remove(boss)
-        
-        return damaged_enemies, damaged_bosses
+
+        # 对丧尸造成范围伤害（-1层）
+        if zombies_list:
+            for zombie in zombies_list[:]:
+                zombie_center = pygame.math.Vector2(zombie.rect.centerx, zombie.rect.centery)
+                distance = explosion_center.distance_to(zombie_center)
+                if distance <= explosion_radius:
+                    if is_line_blocked_by_obstacle(explosion_x, explosion_y, zombie.rect.centerx, zombie.rect.centery, obstacles_list):
+                        continue
+                    damage_multiplier = 1.0 - (distance / explosion_radius) * 0.8
+                    damage = int(base_damage * damage_multiplier)
+                    if damage < int(base_damage * 0.2):
+                        damage = int(base_damage * 0.2)
+                    zombie.health -= damage
+                    damaged_zombies.append((zombie, damage))
+                    if zombie.health <= 0:
+                        corpses_for_current_map.append(Corpse(zombie.rect.centerx, zombie.rect.centery, zombie.original_image, zombie.facing_angle))
+                        zombies_list.remove(zombie)
+
+        return damaged_enemies, damaged_bosses, damaged_zombies
     
     # 生成高级敌人的函数
     def get_random_elite_weapon():
@@ -3035,16 +3070,31 @@ def main():
     # -1层返回电梯位置（地下层最上方中间）
     basement_return_elevator_rect = pygame.Rect(1935, 470, 130, 80)
     request_elevator_from_basement = False
+    # 电梯楼层面板（普通电梯：1-10层；不包含-1层暗门电梯）
+    elevator_floor_menu_open = False
     # -1层底部中间可破墙体（剧情触发后打开）
     basement_breach_wall_rect = pygame.Rect(1870, 3550, 260, 50)
+    # -1层最底部展示墙（用于强化破门演出）
+    basement_bottom_showcase_wall_rect = pygame.Rect(1200, 3880, 1600, 60)
+    basement_bottom_showcase_breach_rect = pygame.Rect(1870, 3880, 260, 60)
     basement_breach_wall_opened = False
     basement_breach_triggered = False
     basement_breach_cutscene_active = False
     basement_breach_cutscene_start = 0
-    BASEMENT_BREACH_CUTSCENE_DURATION = 5000
+    BASEMENT_BREACH_CUTSCENE_DURATION = 1800
+    BASEMENT_BREACH_POST_SPAWN_HOLD_MS = 1200
+    basement_breach_cutscene_end_time = 0
+    BASEMENT_BREACH_CAMERA_HOLD_DURATION = 500
+    basement_breach_camera_lock_until = 0
+    DEBUG_BREACH_CUTSCENE_INFINITE = False   # 调试：破门动画无限时长
+    DEBUG_BREACH_CAMERA_LOCK_FOREVER = False  # 调试：破门后镜头永久锁定在破口
+    DEBUG_DISABLE_FOG = False  # 调试：全局禁用雾效
     basement_breach_spawn_interval = 260
     basement_breach_last_spawn_time = 0
     basement_breach_max_zombies = 80
+    basement_breach_spawn_delay_ms = 600
+    basement_breach_spawn_start_time = 0
+    basement_breach_first_wave_spawned = False
 
     # 将暗门墙壁加入地图1障碍物
     if map_level == 1:
@@ -3069,6 +3119,11 @@ def main():
                 o.rect.width == basement_breach_wall_rect.width and
                 o.rect.height == basement_breach_wall_rect.height):
                 obstacles.remove(o)
+            if (o.rect.x == basement_bottom_showcase_breach_rect.x and
+                o.rect.y == basement_bottom_showcase_breach_rect.y and
+                o.rect.width == basement_bottom_showcase_breach_rect.width and
+                o.rect.height == basement_bottom_showcase_breach_rect.height):
+                obstacles.remove(o)
         if -1 in maps_data:
             maps_data[-1]['obstacles'] = [
                 (o.rect.x, o.rect.y, o.rect.width, o.rect.height)
@@ -3077,13 +3132,21 @@ def main():
 
     def spawn_zombie_from_breach(count=1):
         """从-1层底部中间破口刷出丧尸。"""
-        spawn_x0 = basement_breach_wall_rect.centerx - 90
-        spawn_x1 = basement_breach_wall_rect.centerx + 90
-        # 刷新点上移，避免与墙体边缘重叠导致看起来“没刷出来”
-        spawn_y = basement_breach_wall_rect.top - 70
+        # 过场期间：从镜头下方（底部缺口附近）刷出，向上走入视野
+        if basement_breach_cutscene_active:
+            spawn_x0 = basement_bottom_showcase_breach_rect.centerx - 100
+            spawn_x1 = basement_bottom_showcase_breach_rect.centerx + 100
+            spawn_y = min(world_height - 70, basement_bottom_showcase_breach_rect.bottom + random.randint(10, 60))
+            y_jitter = 20
+        else:
+            spawn_x0 = basement_breach_wall_rect.centerx - 90
+            spawn_x1 = basement_breach_wall_rect.centerx + 90
+            # 常态刷怪点：主缺口外侧
+            spawn_y = basement_breach_wall_rect.top - 70
+            y_jitter = 25
         for _ in range(count):
             zx = random.randint(spawn_x0, spawn_x1)
-            zy = spawn_y + random.randint(-25, 25)
+            zy = spawn_y + random.randint(-y_jitter, y_jitter)
             z = Zombie(zx, zy, zombie_image, health=220)
             zombies.append(z)
 
@@ -3109,6 +3172,147 @@ def main():
                 opened_any = True
         if opened_any and map_level in maps_data:
             maps_data[map_level]['doors'] = [(d.x, d.y, d.width, d.height, d.is_open, d.hinge) for d in doors]
+
+    def get_elevator_floor_nodes():
+        """返回电梯面板中 1-10 层圆形按钮 (floor, cx, cy, radius)。"""
+        nodes = []
+        cols = 5
+        rows = 2
+        radius = 46
+        gap_x = 42
+        gap_y = 46
+        total_w = cols * (radius * 2) + (cols - 1) * gap_x
+        total_h = rows * (radius * 2) + (rows - 1) * gap_y
+        start_x = (screen_width - total_w) // 2 + radius
+        start_y = (screen_height - total_h) // 2 + radius + 20
+        for floor in range(1, 11):
+            idx = floor - 1
+            row = idx // cols
+            col = idx % cols
+            cx = start_x + col * (radius * 2 + gap_x)
+            cy = start_y + row * (radius * 2 + gap_y)
+            nodes.append((floor, cx, cy, radius))
+        return nodes
+
+    def draw_elevator_floor_menu_overlay():
+        """在屏幕顶层绘制电梯楼层面板。"""
+        screen.fill((128, 128, 128))
+        title_font = get_chinese_font(34)
+        tip_font = get_chinese_font(18)
+        title = title_font.render("电梯楼层", True, (235, 235, 235))
+        tip = tip_font.render("点击圆形按钮前往 1-10 层（-1层暗门电梯除外）", True, (230, 230, 230))
+        screen.blit(title, title.get_rect(center=(screen_width // 2, 70)))
+        screen.blit(tip, tip.get_rect(center=(screen_width // 2, 108)))
+        btn_font = get_chinese_font(30)
+        for floor, cx, cy, radius in get_elevator_floor_nodes():
+            fill_color = (55, 55, 55) if floor == map_level else (70, 70, 70)
+            border_color = (255, 220, 90) if floor == map_level else (170, 170, 170)
+            pygame.draw.circle(screen, fill_color, (cx, cy), radius)
+            pygame.draw.circle(screen, border_color, (cx, cy), radius, 3)
+            txt = btn_font.render(str(floor), True, (245, 245, 245))
+            screen.blit(txt, txt.get_rect(center=(cx, cy)))
+
+    def load_map_from_elevator(target_floor):
+        """电梯面板直达指定楼层（1-10）。"""
+        nonlocal map_level, obstacles, roads, doors, enemies, furniture
+        nonlocal bullets, grenade_projectiles, enemy_bullets, corpses_for_current_map
+        nonlocal weapon_drops_for_current_map, grenade_drops_for_current_map
+        nonlocal medkits_for_current_map, ammo_boxes_for_current_map, boss_list, zombies
+        nonlocal camera_x, camera_y, camera_transition_frames
+        nonlocal request_elevator_to_map2, request_elevator_to_map3, request_elevator_to_map1
+        nonlocal request_elevator_to_basement, request_elevator_from_basement
+
+        target_floor = max(1, min(10, target_floor))
+        map_level = target_floor
+        furniture = generate_furniture(map_level)
+
+        if map_level in maps_data:
+            obstacles = [Obstacle(x, y, w, h) for x, y, w, h in maps_data[map_level]['obstacles']]
+            roads = [pygame.Rect(x, y, w, h) for x, y, w, h in maps_data[map_level]['roads']]
+            if 'doors' in maps_data[map_level]:
+                doors = [Door(x, y, w, h, hinge=hg) for x, y, w, h, is_open, hg in maps_data[map_level]['doors']]
+                for i, (x, y, w, h, is_open, hg) in enumerate(maps_data[map_level]['doors']):
+                    if is_open:
+                        doors[i].toggle()
+                rebuild_door_pairs(doors)
+                for door in doors:
+                    if not door.is_open:
+                        obstacles.append(door)
+            else:
+                doors = []
+            enemies = []
+            for enemy_info in maps_data[map_level].get('enemies', []):
+                if len(enemy_info) == 3:
+                    x, y, health = enemy_info
+                    if health == 250:
+                        drop_weapon = get_random_elite_weapon()
+                        enemies.append(Enemy(x, y, elite_enemy_image, health=250, drop_weapon=drop_weapon))
+                    else:
+                        enemies.append(Enemy(x, y, enemy_image, health=health))
+                elif len(enemy_info) >= 4:
+                    x, y, health, drop = enemy_info[:4]
+                    is_elite = len(enemy_info) >= 5 and enemy_info[4]
+                    img = elite_enemy_image if is_elite else enemy_image
+                    enemies.append(Enemy(x, y, img, health=health, drop_weapon=drop))
+        else:
+            random.seed(42 + map_level)
+            obstacles, roads, doors = generate_map(world_width, world_height, player.rect, Obstacle, map_level)
+            furniture = generate_furniture(map_level)
+            for door in doors:
+                if not door.is_open:
+                    obstacles.append(door)
+            enemies = generate_enemies_for_map(obstacles, player.rect, enemy_image, map_level)
+            elite_enemies = generate_elite_enemies_for_map(obstacles, player.rect, elite_enemy_image, count=4, current_map_level=map_level)
+            enemies.extend(elite_enemies)
+            maps_data[map_level] = {
+                'obstacles': [(o.rect.x, o.rect.y, o.rect.width, o.rect.height) for o in obstacles if not isinstance(o, Door)],
+                'roads': [(r.x, r.y, r.width, r.height) for r in roads],
+                'enemies': [(e.rect.x, e.rect.y, e.health) for e in enemies],
+                'doors': [(d.x, d.y, d.width, d.height, d.is_open, d.hinge) for d in doors]
+            }
+
+        if map_level == 1 and not secret_door_opened and secret_wall not in obstacles:
+            obstacles.append(secret_wall)
+
+        bullets.clear()
+        grenade_projectiles.clear()
+        enemy_bullets.clear()
+        corpses_for_current_map.clear()
+        weapon_drops_for_current_map.clear()
+        grenade_drops_for_current_map.clear()
+        medkits_for_current_map.clear()
+        ammo_boxes_for_current_map.clear()
+        boss_list.clear()
+        zombies.clear()
+
+        if 2 <= map_level <= 9:
+            for x, y in generate_medkits_near_obstacles(obstacles, count=3):
+                medkits_for_current_map.append(Medkit(x, y, medkit_image))
+        for x, y in generate_ammo_boxes(obstacles, count=4):
+            ammo_boxes_for_current_map.append(AmmoBox(x, y, ammo_box_image))
+
+        if map_level == 1:
+            player.rect.centerx = elevator_rect.centerx
+            player.rect.centery = elevator_rect.centery + elevator_rect.height + 20
+        elif map_level == 2:
+            player.rect.centerx = elevator_down_rect.centerx
+            player.rect.centery = elevator_down_rect.centery + elevator_down_rect.height + 20
+        else:
+            player.rect.x = world_width // 2
+            player.rect.y = world_height // 2
+
+        request_elevator_to_map2 = False
+        request_elevator_to_map3 = False
+        request_elevator_to_map1 = False
+        request_elevator_to_basement = False
+        request_elevator_from_basement = False
+
+        camera_x = player.rect.x - screen_width // 2
+        camera_y = player.rect.y - screen_height // 2
+        camera_x = max(0, min(camera_x, world_width - screen_width))
+        camera_y = max(0, min(camera_y, world_height - screen_height))
+        camera_transition_frames = 5
+        print(f"电梯到达第 {map_level} 层")
 
     while running:
         current_time = pygame.time.get_ticks() # 获取当前时间
@@ -3598,12 +3802,24 @@ def main():
                     # 调试：过场可按空格跳过
                     if event.key == pygame.K_SPACE:
                         cutscene_driving = False
+                elif elevator_floor_menu_open:
+                    if event.key == pygame.K_ESCAPE:
+                        elevator_floor_menu_open = False
                 # 如果暂停，只处理暂停菜单的按键
                 elif is_paused:
                     if event.key == pygame.K_ESCAPE or event.key == pygame.K_p:
                         is_paused = False
                         pygame.mouse.set_visible(False)
                 else:
+                    if map_level == -1 and basement_breach_cutscene_active:
+                        # 破门过场期间玩家不可操作，仅允许暂停
+                        if event.key == pygame.K_ESCAPE or event.key == pygame.K_p:
+                            is_paused = not is_paused
+                            if is_paused:
+                                pygame.mouse.set_visible(True)
+                            else:
+                                pygame.mouse.set_visible(False)
+                        continue
                     # 调试功能（后续可删除）
                     if event.key == pygame.K_q:
                         if not desk_document.picked_up:
@@ -3666,6 +3882,23 @@ def main():
                     elif event.key == pygame.K_e: # 按下E键开/关门 或 乘电梯
                         player_cx = player.rect.centerx
                         player_cy = player.rect.centery
+                        dist_e1 = math.sqrt((player_cx - elevator_rect.centerx) ** 2 + (player_cy - elevator_rect.centery) ** 2)
+                        dist_e2_up = math.sqrt((player_cx - elevator2_rect.centerx) ** 2 + (player_cy - elevator2_rect.centery) ** 2)
+                        dist_e2_down = math.sqrt((player_cx - elevator_down_rect.centerx) ** 2 + (player_cy - elevator_down_rect.centery) ** 2)
+                        normal_elevator_in_range = (
+                            (map_level == 1 and (player.rect.colliderect(elevator_rect.inflate(240, 240)) or dist_e1 < 260)) or
+                            (map_level == 2 and (
+                                player.rect.colliderect(elevator2_rect.inflate(240, 240)) or
+                                player.rect.colliderect(elevator_down_rect.inflate(240, 240)) or
+                                dist_e2_up < 260 or
+                                dist_e2_down < 260
+                            ))
+                        )
+                        # 普通电梯：弹出楼层面板（1-10层，不包含-1层暗门电梯）
+                        if normal_elevator_in_range:
+                            is_map_open = False
+                            elevator_floor_menu_open = True
+                            continue
                         # 地图1：只有站在电梯上才能启动（与电梯区域重叠时按 E 前往第二层）
                         if map_level == 1 and player.rect.colliderect(elevator_rect):
                             request_elevator_to_map2 = True
@@ -3815,6 +4048,20 @@ def main():
                     player.is_sprinting = False
             # 鼠标按下事件 (moshi=1)
             elif moshi == 1 and event.type == pygame.MOUSEBUTTONDOWN:
+                if elevator_floor_menu_open:
+                    if event.button == 1:
+                        mx, my = pygame.mouse.get_pos()
+                        clicked = False
+                        for floor, cx, cy, radius in get_elevator_floor_nodes():
+                            if (mx - cx) * (mx - cx) + (my - cy) * (my - cy) <= radius * radius:
+                                clicked = True
+                                elevator_floor_menu_open = False
+                                if floor != map_level:
+                                    load_map_from_elevator(floor)
+                                break
+                        if not clicked:
+                            elevator_floor_menu_open = False
+                    continue
                 # 如果暂停，处理暂停菜单的鼠标点击
                 if is_paused:
                     if event.button == 1:  # 左键点击
@@ -3845,6 +4092,9 @@ def main():
                             is_paused = False
                             moshi = 2  # 退出本关，回到关卡选择页面
                             pygame.mouse.set_visible(True)
+                elif map_level == -1 and basement_breach_cutscene_active:
+                    # 破门过场期间屏蔽所有鼠标输入
+                    continue
                 else:
                     # 右键按下
                     if event.button == 3:
@@ -3863,6 +4113,10 @@ def main():
             
             # 鼠标右键松开
             elif moshi == 1 and event.type == pygame.MOUSEBUTTONUP:
+                if map_level == -1 and basement_breach_cutscene_active:
+                    right_mouse_down = False
+                    left_mouse_down = False
+                    continue
                 if event.button == 3:
                     right_mouse_down = False
                 # 左键松开
@@ -4095,6 +4349,13 @@ def main():
                 pygame.display.flip()
                 clock.tick(60)
                 continue
+            # 电梯楼层面板：独立渲染分支，避免被其他图层覆盖
+            if elevator_floor_menu_open:
+                pygame.mouse.set_visible(True)
+                draw_elevator_floor_menu_overlay()
+                pygame.display.flip()
+                clock.tick(60)
+                continue
             # 如果暂停，只绘制暂停菜单，不更新游戏逻辑
             if is_paused:
                 # 绘制灰色背景
@@ -4152,14 +4413,14 @@ def main():
                 continue
             else:
                 # 游戏正常进行时的逻辑
-                # 隐藏鼠标光标
-                pygame.mouse.set_visible(False)
+                # 电梯面板打开时显示鼠标，否则隐藏
+                pygame.mouse.set_visible(elevator_floor_menu_open)
                 
                 # 获取当前按键状态
                 keys = pygame.key.get_pressed()
 
-                # 更新玩家（地图打开/过场期间冻结玩家）
-                if is_map_open or (basement_breach_cutscene_active and map_level == -1):
+                # 更新玩家（地下破口过场期间冻结玩家）
+                if elevator_floor_menu_open or (map_level == -1 and basement_breach_cutscene_active):
                     map_status = None
                 else:
                     map_status = player.update(keys, world_width, world_height, current_time, obstacles + furniture, map_level, min_map_level)
@@ -4188,22 +4449,46 @@ def main():
                         player.rect.centery > world_height // 2):
                         basement_breach_triggered = True
                         basement_breach_cutscene_active = True
+                        # 强制取消所有玩家输入状态，确保过场期间不可操作
+                        left_mouse_down = False
+                        right_mouse_down = False
+                        player.is_sprinting = False
+                        is_map_open = False
                         basement_breach_cutscene_start = current_time
+                        basement_breach_spawn_start_time = current_time + basement_breach_spawn_delay_ms
+                        basement_breach_first_wave_spawned = False
+                        basement_breach_cutscene_end_time = max(
+                            current_time + BASEMENT_BREACH_CUTSCENE_DURATION,
+                            basement_breach_spawn_start_time + BASEMENT_BREACH_POST_SPAWN_HOLD_MS
+                        )
+                        basement_breach_camera_lock_until = (
+                            basement_breach_cutscene_end_time + BASEMENT_BREACH_CAMERA_HOLD_DURATION
+                        )
                         basement_breach_last_spawn_time = current_time
+                        # 触发时立即打开缺口并刷首波
                         open_basement_breach_wall()
-                        spawn_zombie_from_breach(12)
                         add_screen_shake(9.0)
-                        print("警报：地下设施底部墙体被突破！")
+                        print("警报：检测到地下设施底部大批丧尸活动！")
                     # 事件触发后持续从破口刷怪，直到玩家撤离
                     if basement_breach_triggered and not elevator_animating:
+                        if (not basement_breach_first_wave_spawned and
+                            current_time >= basement_breach_spawn_start_time):
+                            spawn_zombie_from_breach(10)
+                            basement_breach_first_wave_spawned = True
+                            basement_breach_last_spawn_time = current_time
+                        can_breach_spawn = basement_breach_cutscene_active or (
+                            current_time >= basement_breach_camera_lock_until
+                        )
                         if (current_time - basement_breach_last_spawn_time >= basement_breach_spawn_interval and
+                            basement_breach_first_wave_spawned and
+                            can_breach_spawn and
                             len(zombies) < basement_breach_max_zombies):
-                            spawn_count = 2 if basement_breach_cutscene_active else 1
-                            spawn_zombie_from_breach(spawn_count)
+                            spawn_zombie_from_breach(2 if basement_breach_cutscene_active else 1)
                             basement_breach_last_spawn_time = current_time
                     # 过场结束
                     if (basement_breach_cutscene_active and
-                        current_time - basement_breach_cutscene_start >= BASEMENT_BREACH_CUTSCENE_DURATION):
+                        (not DEBUG_BREACH_CUTSCENE_INFINITE) and
+                        current_time >= basement_breach_cutscene_end_time):
                         basement_breach_cutscene_active = False
 
                 # 教程系统：检测玩家操作并更新教程步骤（仅关卡1）
@@ -4880,14 +5165,16 @@ def main():
             if keys[pygame.K_a] or keys[pygame.K_d] or keys[pygame.K_w] or keys[pygame.K_s]:
                 is_player_actively_moving = True
 
-            # 摄像机跟随逻辑（地下破口过场时锁定到底部中墙）
-            if basement_breach_cutscene_active and map_level == -1:
+            # 摄像机跟随逻辑（地下破口过场时硬锁定到底部中墙）
+            camera_lock_forever = DEBUG_BREACH_CAMERA_LOCK_FOREVER and basement_breach_triggered
+            if map_level == -1 and (basement_breach_cutscene_active or current_time < basement_breach_camera_lock_until or camera_lock_forever):
                 target_camera_x = basement_breach_wall_rect.centerx - screen_width // 2
-                target_camera_y = basement_breach_wall_rect.centery - screen_height // 2
+                # 过场镜头下移，确保能看到最底部展示墙
+                target_camera_y = basement_bottom_showcase_wall_rect.bottom - screen_height + 40
                 target_camera_x = max(0, min(target_camera_x, world_width - screen_width))
                 target_camera_y = max(0, min(target_camera_y, world_height - screen_height))
-                camera_x += (target_camera_x - camera_x) * 0.12
-                camera_y += (target_camera_y - camera_y) * 0.12
+                camera_x = target_camera_x
+                camera_y = target_camera_y
             elif right_mouse_down:
                 mouse_x, mouse_y = pygame.mouse.get_pos()
                 # 根据当前武器类型设置拖动视野倍数
@@ -5079,6 +5366,23 @@ def main():
                     close_hint = tutorial_hint_font.render("按 TAB 键关闭地图继续", True, (255, 200, 100))
                     close_rect = close_hint.get_rect(center=(screen_width // 2, screen_height - 40))
                     screen.blit(close_hint, close_rect)
+                # 电梯面板优先覆盖显示（防止被地图页遮挡）
+                if elevator_floor_menu_open:
+                    screen.fill((128, 128, 128))
+                    title_font = get_chinese_font(34)
+                    tip_font = get_chinese_font(18)
+                    title = title_font.render("电梯楼层", True, (235, 235, 235))
+                    tip = tip_font.render("点击圆形按钮前往 1-10 层（-1层暗门电梯除外）", True, (230, 230, 230))
+                    screen.blit(title, title.get_rect(center=(screen_width // 2, 70)))
+                    screen.blit(tip, tip.get_rect(center=(screen_width // 2, 108)))
+                    btn_font = get_chinese_font(30)
+                    for floor, cx, cy, radius in get_elevator_floor_nodes():
+                        fill_color = (55, 55, 55) if floor == map_level else (70, 70, 70)
+                        border_color = (255, 220, 90) if floor == map_level else (170, 170, 170)
+                        pygame.draw.circle(screen, fill_color, (cx, cy), radius)
+                        pygame.draw.circle(screen, border_color, (cx, cy), radius, 3)
+                        txt = btn_font.render(str(floor), True, (245, 245, 245))
+                        screen.blit(txt, txt.get_rect(center=(cx, cy)))
             else:
                 # 绘制马路
                 for road in roads:
@@ -5313,7 +5617,9 @@ def main():
                                 
                                 pygame.draw.polygon(screen, arrow_color, [head_point1, head_point2, head_point3])
 
-            if not is_map_open and not (basement_breach_cutscene_active and map_level == -1):
+            if (not is_map_open and
+                not elevator_floor_menu_open and
+                not (map_level == -1 and basement_breach_cutscene_active)):
                 # 如果鼠标左键按下且冷却时间已过，则连续发射子弹（使用当前枪械的属性）
                 if left_mouse_down:
                     # 使用当前枪械的射速
@@ -5409,7 +5715,8 @@ def main():
                                 grenade.base_damage,
                                 enemies,
                                 boss_list,
-                                obstacles
+                                obstacles,
+                                zombies_list=zombies
                             )
                         grenade_projectiles.remove(grenade)
 
@@ -5422,7 +5729,7 @@ def main():
                             # 将子弹位置限制在世界边界内
                             explosion_x = max(0, min(bullet.rect.centerx, world_width))
                             explosion_y = max(0, min(bullet.rect.centery, world_height))
-                            apply_explosion_damage(explosion_x, explosion_y, bullet.explosion_radius, bullet.damage, enemies, boss_list, obstacles)
+                            apply_explosion_damage(explosion_x, explosion_y, bullet.explosion_radius, bullet.damage, enemies, boss_list, obstacles, zombies_list=zombies)
                         bullets_to_remove.append(bullet)
                 for bullet in bullets_to_remove:
                     bullets.remove(bullet)
@@ -5433,7 +5740,7 @@ def main():
                         if bullet.rect.colliderect(obstacle.rect):
                             # 如果是RPG子弹，触发范围伤害
                             if bullet.is_rpg_bullet:
-                                apply_explosion_damage(bullet.rect.centerx, bullet.rect.centery, bullet.explosion_radius, bullet.damage, enemies, boss_list, obstacles)
+                                apply_explosion_damage(bullet.rect.centerx, bullet.rect.centery, bullet.explosion_radius, bullet.damage, enemies, boss_list, obstacles, zombies_list=zombies)
                             bullets.remove(bullet)
                             break
 
@@ -5444,7 +5751,7 @@ def main():
                         if pygame.sprite.collide_rect(bullet, enemy):
                             # 如果是RPG子弹，触发范围伤害
                             if bullet.is_rpg_bullet:
-                                apply_explosion_damage(bullet.rect.centerx, bullet.rect.centery, bullet.explosion_radius, bullet.damage, enemies, boss_list, obstacles)
+                                apply_explosion_damage(bullet.rect.centerx, bullet.rect.centery, bullet.explosion_radius, bullet.damage, enemies, boss_list, obstacles, zombies_list=zombies)
                                 bullets.remove(bullet)
                             else:
                                 # 普通子弹直接造成伤害
@@ -5468,7 +5775,7 @@ def main():
                             if pygame.sprite.collide_rect(bullet, boss):
                                 # 如果是RPG子弹，触发范围伤害
                                 if bullet.is_rpg_bullet:
-                                    apply_explosion_damage(bullet.rect.centerx, bullet.rect.centery, bullet.explosion_radius, bullet.damage, enemies, boss_list, obstacles)
+                                    apply_explosion_damage(bullet.rect.centerx, bullet.rect.centery, bullet.explosion_radius, bullet.damage, enemies, boss_list, obstacles, zombies_list=zombies)
                                     bullets.remove(bullet)
                                 else:
                                     # 普通子弹直接造成伤害
@@ -5527,18 +5834,18 @@ def main():
                                     enemy_bullets.remove(bullet)
                                 break
 
-                # 更新和绘制敌人（电梯动画期间不更新AI）
-                _pause_ai = elevator_animating or (basement_breach_cutscene_active and map_level == -1)
-                _freeze_world = is_map_open or _pause_ai
+                # 更新和绘制敌人（破门过场中仅冻结人类敌人/Boss，丧尸保持移动）
+                _pause_enemy_ai = elevator_animating or elevator_floor_menu_open or (map_level == -1 and basement_breach_cutscene_active)
+                _pause_zombie_ai = elevator_animating or elevator_floor_menu_open
                 for enemy in enemies:
-                    if not _freeze_world:
+                    if not _pause_enemy_ai:
                         enemy.update(player, current_time, enemy_bullets, bullet_image, camera_x, camera_y, screen_width, screen_height, is_player_actively_moving, obstacles + furniture, zombies=zombies)
                         try_open_near_door(enemy.rect, max_dist=85)
                     enemy.draw(screen, camera_x, camera_y)
                 
                 # 更新和绘制Boss（暂停期间不更新AI）
                 for boss in boss_list:
-                    if not _freeze_world:
+                    if not _pause_enemy_ai:
                         boss.update(player, current_time, enemy_bullets, bullet_image, camera_x, camera_y, screen_width, screen_height, is_player_actively_moving, obstacles + furniture, zombies=zombies)
                         try_open_near_door(boss.rect, max_dist=95)
                     boss.draw(screen, camera_x, camera_y)
@@ -5546,7 +5853,7 @@ def main():
                 # 更新和绘制丧尸（仅-1层，第三方阵营，暂停期间不更新）
                 if map_level == -1:
                     for zombie in zombies[:]:
-                        if not _freeze_world:
+                        if not _pause_zombie_ai:
                             zombie.update(player, enemies, current_time, obstacles + furniture)
                             try_open_near_door(zombie.rect, max_dist=80)
                         zombie.draw(screen, camera_x, camera_y)
@@ -5558,25 +5865,22 @@ def main():
                                 enemies.remove(enemy)
 
                 # 更新和绘制敌人子弹（暂停期间清空敌人子弹）
-                if _pause_ai:
+                if _pause_enemy_ai:
                     enemy_bullets.clear()
                     grenade_projectiles.clear()
-                if not is_map_open:
-                    for bullet in enemy_bullets:
-                        bullet.update(current_time)
-                        bullet.draw(screen, camera_x, camera_y)
+                for bullet in enemy_bullets:
+                    bullet.update(current_time)
+                    bullet.draw(screen, camera_x, camera_y)
                 
                 # 移除超出屏幕的敌人子弹
-                if not is_map_open:
-                    enemy_bullets = [bullet for bullet in enemy_bullets if screen.get_rect().colliderect(bullet.rect.move(-camera_x, -camera_y))]
+                enemy_bullets = [bullet for bullet in enemy_bullets if screen.get_rect().colliderect(bullet.rect.move(-camera_x, -camera_y))]
 
                 # 敌人子弹与障碍物碰撞检测（墙壁+家具）
-                if not is_map_open:
-                    for bullet in enemy_bullets[:]:
-                        for obstacle in obstacles + furniture:
-                            if bullet.rect.colliderect(obstacle.rect):
-                                enemy_bullets.remove(bullet)
-                                break
+                for bullet in enemy_bullets[:]:
+                    for obstacle in obstacles + furniture:
+                        if bullet.rect.colliderect(obstacle.rect):
+                            enemy_bullets.remove(bullet)
+                            break
 
                 # 玩家与敌人碰撞检测
                 for enemy in enemies[:]:
@@ -5631,27 +5935,33 @@ def main():
                         break
 
                 # 敌人子弹与玩家碰撞检测
-                if not is_map_open:
-                    for bullet in enemy_bullets[:]:
-                        if player.rect.colliderect(bullet.rect):
-                            enemy_bullets.remove(bullet)
-                            add_screen_shake(5.0)
-                            damage = bullet.damage  # 使用子弹的伤害值（高级敌人20，普通敌人10）
-                            if player.armor >= damage:
-                                player.armor -= damage
-                            else:
-                                remaining_damage = damage - player.armor
-                                player.armor = 0
-                                player.health -= remaining_damage
-                            player.last_damage_time = pygame.time.get_ticks()
-                            player.last_armor_damage_time = pygame.time.get_ticks() # 更新上次护甲受伤害时间
-                            player.health = max(0, player.health) # 确保生命值不低于0
-                    
-                            break
+                for bullet in enemy_bullets[:]:
+                    if player.rect.colliderect(bullet.rect):
+                        enemy_bullets.remove(bullet)
+                        add_screen_shake(5.0)
+                        damage = bullet.damage  # 使用子弹的伤害值（高级敌人20，普通敌人10）
+                        if player.armor >= damage:
+                            player.armor -= damage
+                        else:
+                            remaining_damage = damage - player.armor
+                            player.armor = 0
+                            player.health -= remaining_damage
+                        player.last_damage_time = pygame.time.get_ticks()
+                        player.last_armor_damage_time = pygame.time.get_ticks() # 更新上次护甲受伤害时间
+                        player.health = max(0, player.health) # 确保生命值不低于0
+                
+                        break
 
                 # ===== 视野盲区（Fog of War）=====
-                # 地下破墙过场期间禁用雾效，确保能看到破口与涌出丧尸
-                if not (map_level == -1 and basement_breach_cutscene_active):
+                # 地下破墙动画期间禁用雾效（含过场镜头延时），确保能看到演出与丧尸
+                basement_breach_animation_active = (
+                    map_level == -1 and (
+                        basement_breach_cutscene_active or
+                        current_time < basement_breach_camera_lock_until
+                    )
+                )
+                fog_enabled = (not DEBUG_DISABLE_FOG) and (not basement_breach_animation_active)
+                if fog_enabled:
                     fog_max_dist = int(math.sqrt(screen_width ** 2 + screen_height ** 2))
                     vis_points = compute_visibility_polygon(
                         player.rect.centerx, player.rect.centery, obstacles,
@@ -5667,8 +5977,8 @@ def main():
                     fog.set_colorkey(_fog_ck)  # 洋红色区域变为完全透明
                     screen.blit(fog, (0, 0))
 
-                # 雾效之上重绘墙壁和门（仅在雾效开启时执行；破墙过场时避免盖住丧尸）
-                if not (map_level == -1 and basement_breach_cutscene_active):
+                # 雾效之上重绘墙壁和门（仅在雾效开启时执行；破墙动画时避免盖住丧尸）
+                if fog_enabled:
                     for obstacle in obstacles:
                         if getattr(obstacle, 'is_wall', False):
                             obstacle.draw(screen, camera_x, camera_y)
@@ -5840,22 +6150,22 @@ def main():
                 if doors:
                     player_cx = player.rect.centerx
                     player_cy = player.rect.centery
-                    # 地图1：只有站在电梯上才显示提示（上电梯后按 E 前往第二层）
+                    # 地图1：靠近电梯显示楼层面板提示
                     near_elevator = False
-                    if map_level == 1 and player.rect.colliderect(elevator_rect):
+                    if map_level == 1 and player.rect.colliderect(elevator_rect.inflate(120, 120)):
                         near_elevator = True
                         draw_hint_above(screen, elevator_rect.centerx, elevator_rect.centery,
-                                        "按 E 乘电梯前往第二层", (200, 220, 255), camera_x, camera_y, -45)
+                                        "按 E 打开电梯楼层界面", (200, 220, 255), camera_x, camera_y, -45)
                     # 地图2：上行电梯提示
-                    if map_level == 2 and player.rect.colliderect(elevator2_rect):
+                    if map_level == 2 and player.rect.colliderect(elevator2_rect.inflate(120, 120)):
                         near_elevator = True
                         draw_hint_above(screen, elevator2_rect.centerx, elevator2_rect.centery,
-                                        "按 E 乘电梯前往第三层", (200, 220, 255), camera_x, camera_y, -45)
+                                        "按 E 打开电梯楼层界面", (200, 220, 255), camera_x, camera_y, -45)
                     # 地图2：下行电梯提示
-                    if map_level == 2 and player.rect.colliderect(elevator_down_rect):
+                    if map_level == 2 and player.rect.colliderect(elevator_down_rect.inflate(120, 120)):
                         near_elevator = True
                         draw_hint_above(screen, elevator_down_rect.centerx, elevator_down_rect.centery,
-                                        "按 E 乘电梯返回第一层", (255, 200, 100), camera_x, camera_y, -45)
+                                        "按 E 打开电梯楼层界面", (255, 200, 100), camera_x, camera_y, -45)
                     # 地图1：暗门按钮提示
                     if map_level == 1 and not secret_door_opened:
                         btn_dist = ((player.rect.centerx - secret_button_rect.centerx) ** 2 + (player.rect.centery - secret_button_rect.centery) ** 2) ** 0.5
@@ -5958,31 +6268,64 @@ def main():
                 if map_level == -1:
                     bx = basement_breach_wall_rect.centerx - camera_x
                     by = basement_breach_wall_rect.centery - camera_y
+                    bwx = basement_bottom_showcase_wall_rect.x - camera_x
+                    bwy = basement_bottom_showcase_wall_rect.y - camera_y
                     if basement_breach_cutscene_active:
-                        progress = min(
-                            1.0,
-                            (current_time - basement_breach_cutscene_start) / BASEMENT_BREACH_CUTSCENE_DURATION
-                        )
                         overlay = pygame.Surface((screen_width, screen_height), pygame.SRCALPHA)
                         overlay.fill((0, 0, 0, 70))
                         screen.blit(overlay, (0, 0))
-                        # 破裂扩张效果
-                        crack_r = int(30 + 140 * progress)
-                        pygame.draw.circle(screen, (255, 90, 60), (int(bx), int(by)), crack_r, 4)
-                        pygame.draw.circle(screen, (255, 180, 80), (int(bx), int(by)), max(10, crack_r // 2), 2)
-                        for _ in range(10):
-                            a = random.uniform(0, 2 * math.pi)
-                            r = random.uniform(crack_r * 0.4, crack_r)
-                            px = bx + math.cos(a) * r
-                            py = by + math.sin(a) * r
-                            pygame.draw.circle(screen, (180, 180, 180), (int(px), int(py)), 2)
+                        # 过场时顶层重绘最底部展示墙，突出破门演出
+                        pygame.draw.rect(
+                            screen,
+                            (90, 90, 90),
+                            (bwx, bwy, basement_bottom_showcase_wall_rect.width, basement_bottom_showcase_wall_rect.height)
+                        )
+                        pygame.draw.rect(
+                            screen,
+                            (150, 150, 150),
+                            (bwx, bwy, basement_bottom_showcase_wall_rect.width, basement_bottom_showcase_wall_rect.height),
+                            2
+                        )
+                        # 顶层强调展示墙缺口
+                        sbx = basement_bottom_showcase_breach_rect.x - camera_x
+                        sby = basement_bottom_showcase_breach_rect.y - camera_y
+                        pygame.draw.rect(
+                            screen,
+                            (20, 20, 20),
+                            (sbx, sby, basement_bottom_showcase_breach_rect.width, basement_bottom_showcase_breach_rect.height)
+                        )
+                        pygame.draw.rect(
+                            screen,
+                            (255, 120, 80),
+                            (sbx, sby, basement_bottom_showcase_breach_rect.width, basement_bottom_showcase_breach_rect.height),
+                            2
+                        )
                         alert_font = get_chinese_font(30)
-                        alert_text = alert_font.render("警报：底部收容墙体被突破！", True, (255, 100, 80))
+                        alert_text = alert_font.render("警报：底部检测到大量丧尸，准备撤离！", True, (255, 100, 80))
                         screen.blit(alert_text, alert_text.get_rect(center=(screen_width // 2, 70)))
                     elif basement_breach_triggered:
                         warn_font = get_chinese_font(26)
                         warn_text = warn_font.render("丧尸正在涌入！立即乘电梯返回第一层！", True, (255, 210, 120))
                         screen.blit(warn_text, warn_text.get_rect(center=(screen_width // 2, 65)))
+
+                # 普通电梯楼层面板（1-10层，不包含-1）
+                if elevator_floor_menu_open:
+                    screen.fill((128, 128, 128))
+                    title_font = get_chinese_font(34)
+                    tip_font = get_chinese_font(18)
+                    title = title_font.render("电梯楼层", True, (235, 235, 235))
+                    tip = tip_font.render("点击圆形按钮前往 1-10 层（-1层暗门电梯除外）", True, (230, 230, 230))
+                    screen.blit(title, title.get_rect(center=(screen_width // 2, 70)))
+                    screen.blit(tip, tip.get_rect(center=(screen_width // 2, 108)))
+
+                    btn_font = get_chinese_font(30)
+                    for floor, cx, cy, radius in get_elevator_floor_nodes():
+                        fill_color = (55, 55, 55) if floor == map_level else (70, 70, 70)
+                        border_color = (255, 220, 90) if floor == map_level else (170, 170, 170)
+                        pygame.draw.circle(screen, fill_color, (cx, cy), radius)
+                        pygame.draw.circle(screen, border_color, (cx, cy), radius, 3)
+                        txt = btn_font.render(str(floor), True, (245, 245, 245))
+                        screen.blit(txt, txt.get_rect(center=(cx, cy)))
 
                 # 绘制教程提示（仅关卡1）
                 if current_stage == 1 and tutorial_step > 0 and tutorial_step < 8:
@@ -6175,6 +6518,9 @@ def main():
                     screen_shake_intensity *= screen_shake_decay
                 else:
                     screen_shake_intensity = 0.0
+                # 电梯面板始终放在最后一层绘制，防止被其他页面/图层覆盖
+                if elevator_floor_menu_open:
+                    draw_elevator_floor_menu_overlay()
         else:
             # 非游戏模式时显示鼠标光标
             pygame.mouse.set_visible(True)
